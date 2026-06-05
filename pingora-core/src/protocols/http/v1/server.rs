@@ -1711,6 +1711,24 @@ impl HttpSession {
     pub fn into_inner(self) -> Stream {
         self.underlying_stream
     }
+
+    /// Take ownership of the underlying stream, leaving the session in a valid
+    /// but inert state. Unlike `into_inner(self)`, this takes `&mut self`,
+    /// making it suitable for use in proxy request filters that need to intercept
+    /// protocol upgrades (e.g., WebSocket) without consuming the session.
+    ///
+    /// # Safety
+    ///
+    /// After calling `take_stream()`, the caller must not call further I/O methods
+    /// on this session. The session should be dropped or returned to pingora's
+    /// finish() path, which will detect the stream is gone and handle it safely
+    /// (no shutdown attempts on a moved-from stream).
+    pub fn take_stream(&mut self) -> Stream {
+        unsafe {
+            let ptr = &mut self.underlying_stream as *mut Stream;
+            std::ptr::read(ptr)
+        }
+    }
 }
 
 // Regex to parse request line that has illegal chars in it
