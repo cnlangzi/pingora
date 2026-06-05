@@ -691,6 +691,18 @@ impl Session {
         }
     }
 
+    /// Get mutable reference to the underlying HTTP/1.1 session.
+    /// This is useful for handling WebSocket upgrades and other protocol upgrades
+    /// where direct access to the underlying stream is required.
+    pub fn as_http1_mut(&mut self) -> Option<&mut SessionV1> {
+        match self {
+            Self::H1(s) => Some(s),
+            Self::H2(_) => None,
+            Self::Subrequest(_) => None,
+            Self::Custom(_) => None,
+        }
+    }
+
     pub fn as_http2(&self) -> Option<&SessionV2> {
         match self {
             Self::H1(_) => None,
