@@ -20,10 +20,11 @@ use parking_lot::Mutex;
 use pingora_timeout::{sleep, timeout};
 use std::collections::HashMap;
 use std::io;
+use std::ops::DerefMut;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::sync::{oneshot, watch, Notify, OwnedMutexGuard};
+use tokio::sync::{oneshot, watch, Notify};
 
 use super::lru::Lru;
 use futures::FutureExt;
@@ -272,10 +273,7 @@ impl<S> ConnectionPool<S> {
 
     /// Get a connection from this pool under the same group key
     pub fn get(&self, key: &GroupKey) -> Option<S> {
-        let pool_node = match self.pools.get(key) {
-            Some(v) => v.value().clone(),
-            None => return None,
-        };
+        let pool_node = self.pools.get(key)?.value().clone();
 
         if let Some((id, connection)) = pool_node.get_any() {
             self.lru.pop(&id); // the notified is not needed
@@ -322,10 +320,13 @@ impl<S> ConnectionPool<S> {
     ///
     /// If the connection is reused via [Self::get()] or being evicted, this function will just exit.
     ///
+    /// `connection` is a guard that gives exclusive access to the connection while it is polled.
+    /// It is dropped when this function returns.
+    ///
     /// Returns `true` if the connection was evicted from the pool, and `false` otherwise.
     pub async fn idle_poll<Stream>(
         &self,
-        connection: OwnedMutexGuard<Stream>,
+        connection: impl DerefMut<Target = Stream>,
         meta: &ConnectionMeta,
         timeout: Option<Duration>,
         notify_evicted: Arc<Notify>,
@@ -442,7 +443,7 @@ impl<S> ConnectionPool<S> {
 }
 
 async fn read_with_timeout<S>(
-    mut connection: OwnedMutexGuard<S>,
+    mut connection: impl DerefMut<Target = S>,
     timeout_duration: Option<Duration>,
 ) -> io::Result<usize>
 where

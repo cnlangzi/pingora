@@ -15,7 +15,8 @@
 #[cfg(unix)]
 use crate::protocols::l4::ext::connect_uds;
 use crate::protocols::l4::ext::{
-    connect_with as tcp_connect, set_dscp, set_recv_buf, set_tcp_fastopen_connect,
+    connect_error_local_addr, connect_with_attempt as tcp_connect, set_dscp, set_recv_buf,
+    set_tcp_fastopen_connect, ConnectAttempt, ConnectErrorDetails,
 };
 use crate::protocols::l4::socket::SocketAddr;
 use crate::protocols::l4::stream::Stream;
@@ -35,6 +36,21 @@ use std::os::windows::io::AsRawSocket;
 #[async_trait]
 pub trait Connect: std::fmt::Debug {
     async fn connect(&self, addr: &SocketAddr) -> Result<Stream>;
+}
+
+/// Additional metadata available on errors from TCP connection attempts.
+pub trait ConnectErrorExt {
+    /// Returns the local address assigned to the failed connection attempt, if one was recorded.
+    ///
+    /// Returns `None` for unrelated errors, non-TCP connections, or failures that occurred before
+    /// the operating system assigned a local address or port.
+    fn connect_local_addr(&self) -> Option<InetSocketAddr>;
+}
+
+impl ConnectErrorExt for Error {
+    fn connect_local_addr(&self) -> Option<InetSocketAddr> {
+        connect_error_local_addr(self)
+    }
 }
 
 /// Settings for binding on connect
@@ -99,49 +115,66 @@ where
             .err_context(|| format!("Fail to establish CONNECT proxy: {}", peer));
     }
     let peer_addr = peer.address();
+    let mut local_addr = None;
     let mut stream: Stream =
         if let Some(custom_l4) = peer.get_peer_options().and_then(|o| o.custom_l4.as_ref()) {
             custom_l4.connect(peer_addr).await?
         } else {
             match peer_addr {
                 SocketAddr::Inet(addr) => {
-                    let connect_future = tcp_connect(addr, bind_to.as_ref(), |socket| {
-                        #[cfg(unix)]
-                        let raw = socket.as_raw_fd();
-                        #[cfg(windows)]
-                        let raw = socket.as_raw_socket();
+                    let mut connect_attempt = ConnectAttempt::default();
+                    let connect_future = tcp_connect(
+                        addr,
+                        bind_to.as_ref(),
+                        |socket| {
+                            #[cfg(unix)]
+                            let raw = socket.as_raw_fd();
+                            #[cfg(windows)]
+                            let raw = socket.as_raw_socket();
 
-                        if peer.tcp_fast_open() {
-                            set_tcp_fastopen_connect(raw)?;
-                        }
-                        if let Some(recv_buf) = peer.tcp_recv_buf() {
-                            debug!("Setting recv buf size");
-                            set_recv_buf(raw, recv_buf)?;
-                        }
-                        if let Some(dscp) = peer.dscp() {
-                            debug!("Setting dscp");
-                            set_dscp(raw, dscp)?;
-                        }
+                            if peer.tcp_fast_open() {
+                                set_tcp_fastopen_connect(raw)?;
+                            }
+                            if let Some(recv_buf) = peer.tcp_recv_buf() {
+                                debug!("Setting recv buf size");
+                                set_recv_buf(raw, recv_buf)?;
+                            }
+                            if let Some(dscp) = peer.dscp() {
+                                debug!("Setting dscp");
+                                set_dscp(raw, dscp)?;
+                            }
 
-                        if let Some(tweak_hook) = peer
-                            .get_peer_options()
-                            .and_then(|o| o.upstream_tcp_sock_tweak_hook.clone())
-                        {
-                            tweak_hook(socket)?;
-                        }
+                            if let Some(tweak_hook) = peer
+                                .get_peer_options()
+                                .and_then(|o| o.upstream_tcp_sock_tweak_hook.clone())
+                            {
+                                tweak_hook(socket)?;
+                            }
 
-                        Ok(())
-                    });
+                            Ok(())
+                        },
+                        &mut connect_attempt,
+                    );
                     let conn_res = match peer.connection_timeout() {
-                        Some(t) => pingora_timeout::timeout(t, connect_future)
-                            .await
-                            .explain_err(ConnectTimedout, |_| {
-                                format!("timeout {t:?} connecting to server {peer}")
-                            })?,
+                        Some(t) => match pingora_timeout::timeout(t, connect_future).await {
+                            Ok(result) => result,
+                            Err(e) => {
+                                let context = format!("timeout {t:?} connecting to server {peer}");
+                                return Err(match connect_attempt.local_addr() {
+                                    Some(local_addr) => Error::because(
+                                        ConnectTimedout,
+                                        context,
+                                        ConnectErrorDetails::new(e, Some(local_addr)),
+                                    ),
+                                    None => Error::because(ConnectTimedout, context, e),
+                                });
+                            }
+                        },
                         None => connect_future.await,
                     };
                     match conn_res {
                         Ok(socket) => {
+                            local_addr = connect_attempt.local_addr();
                             debug!("connected to new server: {}", peer.address());
                             Ok(socket.into())
                         }
@@ -205,6 +238,12 @@ where
         .peer_addr
         .set(Some(peer_addr.clone()))
         .expect("newly created OnceCell must be empty");
+    if let Some(local_addr) = local_addr {
+        digest
+            .local_addr
+            .set(Some(SocketAddr::Inet(local_addr)))
+            .expect("newly created OnceCell must be empty");
+    }
     stream.set_socket_digest(digest);
 
     Ok(stream)
@@ -274,7 +313,7 @@ async fn proxy_connect<P: Peer>(peer: &P) -> Result<Stream> {
         connect_uds(&proxy.next_hop)
             .await
             .or_err_with(ConnectError, || {
-                format!("CONNECT proxy connect() error to {:?}", &proxy.next_hop)
+                format!("CONNECT proxy connect() error to {:?}", proxy.next_hop)
             })?
             .into(),
     );
@@ -307,20 +346,21 @@ async fn proxy_connect<P: Peer>(peer: &P) -> Result<Stream> {
 mod tests {
     use super::*;
     use crate::upstreams::peer::{BasicPeer, HttpPeer, Proxy};
-    use pingora_error::ErrorType;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
-    use std::time::{Duration, Instant};
-    use tokio::time::sleep;
+    use std::time::Duration;
 
     #[cfg(target_os = "linux")]
     async fn wait_for_peer<P>(peer: &P)
     where
         P: Peer + Send + Sync,
     {
-        use ErrorType as E;
+        use pingora_error::ErrorType as E;
+        use std::time::Instant;
+        use tokio::time::sleep;
+
         let start = Instant::now();
         let mut res = connect(peer, None).await;
         let mut delay = Duration::from_millis(5);
@@ -344,6 +384,26 @@ mod tests {
         assert_eq!(new_session.unwrap_err().etype(), &ConnectRefused)
     }
 
+    #[tokio::test]
+    async fn test_local_addr_is_cached() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = listener.local_addr().unwrap().to_string();
+        let peer = BasicPeer::new(&peer_addr);
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap() });
+
+        let stream = connect(&peer, None).await.unwrap();
+        let digest = stream.get_socket_digest().unwrap();
+        let cached_addr = digest
+            .local_addr
+            .get()
+            .expect("local address should be cached during connect")
+            .as_ref()
+            .and_then(SocketAddr::as_inet)
+            .unwrap();
+        let (_, observed_client_addr) = accept.await.unwrap();
+        assert_eq!(*cached_addr, observed_client_addr);
+    }
+
     // TODO broken on arm64
     #[ignore]
     #[tokio::test]
@@ -355,7 +415,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_conn_error_addr_not_avail() {
-        let peer = HttpPeer::new("127.0.0.1:121".to_string(), false, "".to_string());
+        let peer = HttpPeer::new("127.0.0.1:121".to_string(), false, "".to_string()).unwrap();
         let addr = "192.0.2.2:0".parse().ok();
         let bind_to = BindTo {
             addr,
@@ -367,7 +427,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_conn_error_other() {
-        let peer = HttpPeer::new("240.0.0.1:80".to_string(), false, "".to_string()); // non localhost
+        let peer = HttpPeer::new("240.0.0.1:80".to_string(), false, "".to_string()).unwrap(); // non localhost
         let addr = "127.0.0.1:0".parse().ok();
         // create an error: cannot send from src addr: localhost to dst addr: a public IP
         let bind_to = BindTo {
@@ -399,6 +459,12 @@ mod tests {
             "unexpected error type: {:?}",
             err.etype()
         );
+        if err.etype() == &ConnectTimedout {
+            let local_addr = err
+                .connect_local_addr()
+                .expect("local address should be captured before the timeout");
+            assert_ne!(local_addr.port(), 0);
+        }
     }
 
     #[tokio::test]
@@ -447,7 +513,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn test_connect_proxy_fail() {
-        let mut peer = HttpPeer::new("1.1.1.1:80".to_string(), false, "".to_string());
+        let mut peer = HttpPeer::new("1.1.1.1:80".to_string(), false, "".to_string()).unwrap();
         let mut path = PathBuf::new();
         path.push("/tmp/123");
         peer.proxy = Some(Proxy {
@@ -474,7 +540,7 @@ mod tests {
         // Wait for the server to be ready
         ready_rx.await.unwrap();
 
-        let mut peer = HttpPeer::new("1.1.1.1:80".to_string(), false, "".to_string());
+        let mut peer = HttpPeer::new("1.1.1.1:80".to_string(), false, "".to_string()).unwrap();
         let mut path = PathBuf::new();
         path.push(&socket_path);
         peer.proxy = Some(Proxy {
@@ -503,7 +569,7 @@ mod tests {
         // Wait for the server to be ready
         ready_rx.await.unwrap();
 
-        let mut peer = HttpPeer::new("1.1.1.1:80".to_string(), false, "".to_string());
+        let mut peer = HttpPeer::new("1.1.1.1:80".to_string(), false, "".to_string()).unwrap();
         let mut path = PathBuf::new();
         path.push(&socket_path);
         peer.proxy = Some(Proxy {
@@ -574,7 +640,7 @@ mod tests {
         let (low, _) = get_ip_local_port_range();
         let high = low + 1;
 
-        let peer = HttpPeer::new(format!("127.0.0.1:{port}"), false, "".to_string());
+        let peer = HttpPeer::new(format!("127.0.0.1:{port}"), false, "".to_string()).unwrap();
         let mut bind_to = BindTo {
             addr: "127.0.0.1:0".parse().ok(),
             ..Default::default()
