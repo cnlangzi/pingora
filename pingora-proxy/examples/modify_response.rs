@@ -51,7 +51,7 @@ impl ProxyHttp for Json2Yaml {
         _session: &mut Session,
         _ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
-        let peer = Box::new(HttpPeer::new(self.addr, false, HOST.to_owned()));
+        let peer = Box::new(HttpPeer::new(self.addr, false, HOST.to_owned())?);
         Ok(peer)
     }
 
@@ -84,7 +84,7 @@ impl ProxyHttp for Json2Yaml {
         Ok(())
     }
 
-    fn response_body_filter(
+    async fn response_body_filter(
         &self,
         _session: &mut Session,
         body: &mut Option<Bytes>,

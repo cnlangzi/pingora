@@ -27,7 +27,11 @@ mod thread_zstd;
 use bytes::BufMut;
 use http::Version;
 use pingora_error::{Error, ErrorType, ImmutStr, Result};
+pub use pingora_http::h1::{HeaderLimit, ResponseParserConfig};
 use pingora_http::ResponseHeader;
+use pingora_http_parser::{
+    parse_response, HeaderStorage, Response as ParsedResponse, Status as ParseStatus,
+};
 use std::cell::RefCell;
 use std::ops::DerefMut;
 use thread_local::ThreadLocal;
@@ -38,6 +42,7 @@ use thread_local::ThreadLocal;
 /// storage.
 pub struct HeaderSerde {
     compression: ZstdCompression,
+    parser_config: ResponseParserConfig,
     // internal buffer for uncompressed data to be compressed and vice versa
     buf: ThreadLocal<RefCell<Vec<u8>>>,
 }
@@ -50,14 +55,31 @@ impl HeaderSerde {
     /// Create a new [HeaderSerde]
     ///
     /// An optional zstd compression dictionary can be provided to improve the compression ratio
-    /// and speed. See [dict] for more details.
+    /// and speed. See [dict] for more details. Deserialization uses the default
+    /// [`HeaderLimit`]; use [`Self::new_with_header_limit`] or
+    /// [`Self::new_with_parser_config`] to accept a different field count or
+    /// legacy response syntax.
     pub fn new(dict: Option<Vec<u8>>) -> Self {
+        Self::new_with_header_limit(dict, HeaderLimit::default())
+    }
+
+    /// Create a new [`HeaderSerde`] with a field-count limit for deserialization.
+    pub fn new_with_header_limit(dict: Option<Vec<u8>>, header_limit: HeaderLimit) -> Self {
+        Self::new_with_parser_config(dict, ResponseParserConfig::new(header_limit))
+    }
+
+    /// Create a new [`HeaderSerde`] with response parser configuration for deserialization.
+    pub fn new_with_parser_config(
+        dict: Option<Vec<u8>>,
+        parser_config: ResponseParserConfig,
+    ) -> Self {
         if let Some(dict) = dict {
             HeaderSerde {
                 compression: ZstdCompression::WithDict(thread_zstd::CompressionWithDict::new(
                     &dict,
                     COMPRESS_LEVEL,
                 )),
+                parser_config,
                 buf: ThreadLocal::new(),
             }
         } else {
@@ -66,6 +88,7 @@ impl HeaderSerde {
                     thread_zstd::Compression::new(),
                     COMPRESS_LEVEL,
                 ),
+                parser_config,
                 buf: ThreadLocal::new(),
             }
         }
@@ -93,7 +116,7 @@ impl HeaderSerde {
         buf.clear(); // reset the buf
         self.compression
             .decompress_to_buffer(data, buf.deref_mut())?;
-        buf_to_http_header(&buf)
+        buf_to_http_header_with_parser_config(&buf, self.parser_config)
     }
 }
 
@@ -191,20 +214,24 @@ fn resp_header_to_buf(resp: &ResponseHeader, buf: &mut Vec<u8>) -> usize {
     buf.len()
 }
 
-// Should match pingora http1 setting
-const MAX_HEADERS: usize = 256;
+#[inline]
+#[cfg(test)]
+fn buf_to_http_header(buf: &[u8]) -> Result<ResponseHeader> {
+    buf_to_http_header_with_parser_config(buf, ResponseParserConfig::new(HeaderLimit::Unlimited))
+}
 
 #[inline]
-fn buf_to_http_header(buf: &[u8]) -> Result<ResponseHeader> {
-    let mut headers = vec![httparse::EMPTY_HEADER; MAX_HEADERS];
-    let mut resp = httparse::Response::new(&mut headers);
-
-    match resp.parse(buf) {
-        Ok(s) => match s {
-            httparse::Status::Complete(_size) => parsed_to_header(&resp),
-            // we always feed the but that contains the entire header to parse
-            _ => Error::e_explain(ErrorType::InternalError, "incomplete uncompressed header"),
-        },
+fn buf_to_http_header_with_parser_config(
+    buf: &[u8],
+    parser_config: ResponseParserConfig,
+) -> Result<ResponseHeader> {
+    let mut storage = HeaderStorage::new();
+    match parse_response(&mut storage, buf, parser_config) {
+        Ok(ParseStatus::Complete(_size, response)) => parsed_to_header(&response),
+        Ok(ParseStatus::Partial) => {
+            // We always feed the buffer that contains the entire header to parse.
+            Error::e_explain(ErrorType::InternalError, "incomplete uncompressed header")
+        }
         Err(e) => Error::e_because(
             ErrorType::InternalError,
             format!(
@@ -218,13 +245,14 @@ fn buf_to_http_header(buf: &[u8]) -> Result<ResponseHeader> {
 }
 
 #[inline]
-fn parsed_to_header(parsed: &httparse::Response) -> Result<ResponseHeader> {
+fn parsed_to_header(parsed: &ParsedResponse<'_, '_>) -> Result<ResponseHeader> {
     // code should always be there
     // TODO: allow reading the parsed http version?
-    let mut resp = ResponseHeader::build(parsed.code.unwrap(), Some(parsed.headers.len()))?;
+    let mut resp = ResponseHeader::build(parsed.code().unwrap(), Some(parsed.header_count()))?;
 
-    for header in parsed.headers.iter() {
-        resp.append_header(header.name.to_string(), header.value)?;
+    for header in parsed.headers() {
+        let header_value = pingora_http::header_value_from_slice(header.value);
+        resp.append_header(header.name.to_string(), header_value)?;
     }
 
     Ok(resp)
@@ -265,6 +293,49 @@ mod tests {
     }
 
     #[test]
+    fn test_serialize_deserialize_many_headers() {
+        let serde = HeaderSerde::new_with_header_limit(None, HeaderLimit::Unlimited);
+        let mut header = ResponseHeader::build(200, Some(4096)).unwrap();
+        for i in 0..4096 {
+            header
+                .append_header(format!("x-{i}"), format!("value-{i}"))
+                .unwrap();
+        }
+
+        let compressed = serde.serialize(&header).unwrap();
+        let header2 = serde.deserialize(&compressed).unwrap();
+        assert_eq!(header.headers, header2.headers);
+    }
+
+    #[test]
+    fn test_default_header_limit() {
+        let serde = HeaderSerde::new(None);
+        let mut header = ResponseHeader::build(200, Some(257)).unwrap();
+        for i in 0..257 {
+            header
+                .append_header(format!("x-{i}"), format!("value-{i}"))
+                .unwrap();
+        }
+
+        let compressed = serde.serialize(&header).unwrap();
+        assert!(serde.deserialize(&compressed).is_err());
+    }
+
+    #[test]
+    fn test_ser_de_keeps_repeated_headers() {
+        // repeated fields such as Set-Cookie survive a round trip instead of collapsing to one
+        let serde = HeaderSerde::new(None);
+        let mut header = ResponseHeader::build(200, None).unwrap();
+        header.append_header("Set-Cookie", "a=1").unwrap();
+        header.append_header("Set-Cookie", "b=2").unwrap();
+
+        let compressed = serde.serialize(&header).unwrap();
+        let header2 = serde.deserialize(&compressed).unwrap();
+        let cookies: Vec<_> = header2.headers.get_all("set-cookie").iter().collect();
+        assert_eq!(cookies, ["a=1", "b=2"]);
+    }
+
+    #[test]
     fn test_no_headers() {
         let serde = HeaderSerde::new(None);
         let header = ResponseHeader::build(200, None).unwrap(); // No headers added
@@ -288,8 +359,100 @@ mod tests {
         assert_eq!(buf.len(), 19);
         assert_eq!(buf, b"HTTP/1.1 200 OK\r\n\r\n");
 
-        // Test that httparse can handle this
+        // Test that the configured HTTP/1 parser can handle this.
         let parsed = buf_to_http_header(&buf).unwrap();
         assert_eq!(parsed.status.as_u16(), 200);
+    }
+
+    #[test]
+    fn test_serialize_deserialize_multiline_header() {
+        let serde = HeaderSerde::new(None);
+        let parser_config = ResponseParserConfig::new(HeaderLimit::Unlimited)
+            .with_obsolete_multiline_headers_in_responses(true);
+
+        let multiline_response = b"HTTP/1.1 200 OK\r\n\
+Content-Security-Policy: default-src 'self';\r\n \
+       script-src 'self' 'unsafe-inline' 'unsafe-eval' blob:;\r\n \
+       connect-src 'self' wss:;\r\n \
+       img-src 'self' data: blob:\r\n\
+Content-Type: text/html\r\n\
+\r\n";
+
+        let header1 =
+            buf_to_http_header_with_parser_config(multiline_response, parser_config).unwrap();
+        let compressed = serde.serialize(&header1).unwrap();
+        let header2 = serde.deserialize(&compressed).unwrap();
+
+        assert_eq!(header1.status, header2.status);
+        // After obs-fold normalization the parsed and the round-tripped
+        // values must agree byte-for-byte.
+        assert_eq!(header1.headers, header2.headers);
+
+        let csp = header1.headers.get("content-security-policy").unwrap();
+        let csp_bytes = csp.as_bytes();
+        // No CR or LF must survive normalization — that's the whole point.
+        assert!(!csp_bytes.contains(&b'\r'));
+        assert!(!csp_bytes.contains(&b'\n'));
+        // Each fold collapses to a single SP between the joined segments.
+        let csp_str = std::str::from_utf8(csp_bytes).unwrap();
+        assert_eq!(
+            csp_str,
+            "default-src 'self'; \
+             script-src 'self' 'unsafe-inline' 'unsafe-eval' blob:; \
+             connect-src 'self' wss:; \
+             img-src 'self' data: blob:"
+        );
+    }
+
+    #[test]
+    fn test_serialize_normalizes_space_before_header_colon() {
+        let parser_config =
+            ResponseParserConfig::default().with_spaces_after_header_name_in_responses(true);
+        let response = buf_to_http_header_with_parser_config(
+            b"HTTP/1.1 200 OK\r\nName : value\r\n\r\n",
+            parser_config,
+        )
+        .unwrap();
+
+        let mut canonical = Vec::new();
+        resp_header_to_buf(&response, &mut canonical);
+        assert!(canonical
+            .windows(b"Name: value\r\n".len())
+            .any(|window| window == b"Name: value\r\n"));
+
+        let serde = HeaderSerde::new(None);
+        let compressed = serde.serialize(&response).unwrap();
+        let round_tripped = serde.deserialize(&compressed).unwrap();
+        assert_eq!(response.headers, round_tripped.headers);
+    }
+
+    #[test]
+    fn test_parsing_multiline_header() {
+        let parser_config = ResponseParserConfig::new(HeaderLimit::Unlimited)
+            .with_obsolete_multiline_headers_in_responses(true);
+        let multiline_response = b"HTTP/1.1 200 OK\r\n\
+X-Custom: foo\r\n \
+       bar\r\n \
+       baz\r\n\
+\r\n";
+
+        let header =
+            buf_to_http_header_with_parser_config(multiline_response, parser_config).unwrap();
+
+        assert!(header.headers.contains_key("x-custom"));
+        assert_eq!(header.headers.len(), 1);
+
+        let custom = header.headers.get("x-custom").unwrap();
+        let custom_bytes = custom.as_bytes();
+        assert!(!custom_bytes.contains(&b'\r'));
+        assert!(!custom_bytes.contains(&b'\n'));
+        // "foo\r\n <ws>bar\r\n <ws>baz" -> "foo bar baz" (each fold a single SP).
+        assert_eq!(custom_bytes, b"foo bar baz");
+    }
+
+    #[test]
+    fn test_response_compatibility_syntax_is_rejected_by_default() {
+        assert!(buf_to_http_header(b"HTTP/1.1 200 OK\r\nName : value\r\n\r\n").is_err());
+        assert!(buf_to_http_header(b"HTTP/1.1 200 OK\r\nName: value\r\n folded\r\n\r\n").is_err());
     }
 }

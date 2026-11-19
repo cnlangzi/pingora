@@ -16,22 +16,22 @@
 
 pub mod http;
 pub mod l4;
-mod offload;
-
 #[cfg(feature = "any_tls")]
 mod tls;
 
 #[cfg(not(feature = "any_tls"))]
 use crate::tls::connectors as tls;
 
-use crate::protocols::Stream;
+use crate::protocols::http::v1::ResponseParserConfig;
+use crate::protocols::l4::ext::attach_connect_local_addr;
+use crate::protocols::{GetSocketDigest, Stream};
 use crate::server::configuration::ServerConf;
 use crate::upstreams::peer::{Peer, ALPN};
 
+use crate::offload::OffloadRuntime;
 pub use l4::Connect as L4Connect;
 use l4::{connect as l4_connect, BindTo};
 use log::{debug, error, warn};
-use offload::OffloadRuntime;
 use parking_lot::RwLock;
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
 use pingora_pool::{ConnectionMeta, ConnectionPool};
@@ -41,7 +41,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tls::TlsConnector;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 
 #[derive(Clone, Debug)]
 pub(crate) struct IdleConnection {
@@ -95,6 +95,12 @@ pub struct ConnectorOptions {
     /// its per-worker meaning even though the pool itself now uses a single
     /// global LRU.
     pub keepalive_pool_size: usize,
+    /// Configuration for parsing HTTP/1 response heads.
+    ///
+    /// By default, at most 256 fields are accepted and obsolete response syntax is rejected.
+    /// The field-count limit does not replace Pingora's byte-size limit for the complete
+    /// response head.
+    pub h1_response_parser_config: ResponseParserConfig,
     /// Optionally offload the connection establishment to dedicated thread pools
     ///
     /// TCP and TLS connection establishment can be CPU intensive. Sometimes such tasks can slow
@@ -116,12 +122,6 @@ pub struct ConnectorOptions {
 impl ConnectorOptions {
     /// Derive the [ConnectorOptions] from a [ServerConf]
     pub fn from_server_conf(server_conf: &ServerConf) -> Self {
-        // if both pools and threads are Some(>0)
-        let offload_threadpool = server_conf
-            .upstream_connect_offload_threadpools
-            .zip(server_conf.upstream_connect_offload_thread_per_pool)
-            .filter(|(pools, threads)| *pools > 0 && *threads > 0);
-
         // create SocketAddrs with port 0 for src addr bind
 
         let bind_to_v4 = server_conf
@@ -150,7 +150,8 @@ impl ConnectorOptions {
             keepalive_pool_size: server_conf
                 .upstream_keepalive_pool_size
                 .saturating_mul(server_conf.threads.max(1)),
-            offload_threadpool,
+            h1_response_parser_config: ResponseParserConfig::default(),
+            offload_threadpool: server_conf.upstream_connect_offload_threadpool(),
             bind_to_v4,
             bind_to_v6,
             keepalive_pool_callback: None,
@@ -166,6 +167,7 @@ impl ConnectorOptions {
             cert_key_file: None,
             debug_ssl_keylog: false,
             keepalive_pool_size,
+            h1_response_parser_config: ResponseParserConfig::default(),
             offload_threadpool: None,
             bind_to_v4: vec![],
             bind_to_v6: vec![],
@@ -174,10 +176,24 @@ impl ConnectorOptions {
     }
 }
 
+#[cfg(test)]
+mod response_parser_config_tests {
+    use super::*;
+
+    #[test]
+    fn connector_options_use_strict_response_parser_defaults() {
+        assert_eq!(
+            ConnectorOptions::new(1).h1_response_parser_config,
+            ResponseParserConfig::default()
+        );
+    }
+}
+
 /// [TransportConnector] provides APIs to connect to servers via TCP or TLS with connection reuse
 pub struct TransportConnector {
     tls_ctx: tls::Connector,
-    connection_pool: Arc<ConnectionPool<Arc<Mutex<Stream>>>>,
+    /// The stream is taken out of the `Option` when the connection is reused.
+    connection_pool: Arc<ConnectionPool<Arc<Mutex<Option<Stream>>>>>,
     offload: Option<OffloadRuntime>,
     bind_to_v4: Vec<SocketAddr>,
     bind_to_v6: Vec<SocketAddr>,
@@ -211,7 +227,7 @@ impl TransportConnector {
         TransportConnector {
             tls_ctx: tls::Connector::new(options),
             connection_pool: Arc::new(ConnectionPool::new(pool_size)),
-            offload: offload.map(|v| OffloadRuntime::new(v.0, v.1)),
+            offload: offload.map(|v| OffloadRuntime::new("upstream connect offload", v.0, v.1)),
             bind_to_v4,
             bind_to_v6,
             preferred_http_version: PreferredHttpVersion::new(),
@@ -233,11 +249,22 @@ impl TransportConnector {
         let stream = if let Some(rt) = rt {
             let peer = peer.clone();
             let tls_ctx = self.tls_ctx.clone();
-            rt.spawn(async move { do_connect(&peer, bind_to, alpn_override, &tls_ctx.ctx).await })
+            let offload_start = Instant::now();
+            rt.spawn(async move {
+                let offload_wait = offload_start.elapsed();
+                do_connect(
+                    &peer,
+                    bind_to,
+                    alpn_override,
+                    &tls_ctx.ctx,
+                    Some(offload_wait),
+                )
                 .await
-                .or_err(InternalError, "offload runtime failure")??
+            })
+            .await
+            .or_err(InternalError, "offload runtime failure")??
         } else {
-            do_connect(peer, bind_to, alpn_override, &self.tls_ctx.ctx).await?
+            do_connect(peer, bind_to, alpn_override, &self.tls_ctx.ctx, None).await?
         };
 
         Ok(stream)
@@ -248,12 +275,12 @@ impl TransportConnector {
         match self.connection_pool.get(&peer.reuse_hash()) {
             Some(s) => {
                 debug!("find reusable stream, trying to acquire it");
-                {
-                    let _ = s.lock().await;
-                } // wait for the idle poll to release it
-                match Arc::try_unwrap(s) {
-                    Ok(l) => {
-                        let mut stream = l.into_inner();
+                // Wait for the idle poll to release the stream, then move it out under the lock.
+                // The idle poll's guard keeps its own `Arc` for a moment after unlocking, so
+                // `Arc::try_unwrap` here could still see a second owner.
+                let stream = s.lock().await.take();
+                match stream {
+                    Some(mut stream) => {
                         // test_reusable_stream: we assume server would never actively send data
                         // first on an idle stream.
                         #[cfg(unix)]
@@ -285,8 +312,10 @@ impl TransportConnector {
                             }
                         }
                     }
-                    Err(_) => {
-                        error!("failed to acquire reusable stream");
+                    None => {
+                        // Unreachable: `pool.get()` hands each pooled entry to exactly one caller,
+                        // and only this function takes the stream out of the slot.
+                        error!("reusable stream was already taken");
                         None
                     }
                 }
@@ -317,9 +346,15 @@ impl TransportConnector {
         let id = stream.id();
         let meta = ConnectionMeta::new(key, id);
         debug!("Try to keepalive client session");
-        let stream = Arc::new(Mutex::new(stream));
-        let locked_stream = stream.clone().try_lock_owned().unwrap(); // safe as we just created it
-        let (notify_close, watch_use) = self.connection_pool.put(&meta, stream);
+        let pooled = Arc::new(Mutex::new(None));
+        let locked_stream = OwnedMutexGuard::map(
+            pooled
+                .clone()
+                .try_lock_owned()
+                .expect("newly created mutex must be unlocked"),
+            |slot| slot.insert(stream),
+        );
+        let (notify_close, watch_use) = self.connection_pool.put(&meta, pooled);
         let idle_meta = IdleConnection::new(meta);
         let pool = self.connection_pool.clone(); //clone the arc
         let keepalive_pool_callback = self.keepalive_pool_callback.clone();
@@ -389,10 +424,12 @@ async fn do_connect<P: Peer + Send + Sync>(
     bind_to: Option<BindTo>,
     alpn_override: Option<ALPN>,
     tls_ctx: &TlsConnector,
+    offload_wait_duration: Option<Duration>,
 ) -> Result<Stream> {
     // Create the future that does the connections, but don't evaluate it until
     // we decide if we need a timeout or not
-    let connect_future = do_connect_inner(peer, bind_to, alpn_override, tls_ctx);
+    let connect_future =
+        do_connect_inner(peer, bind_to, alpn_override, tls_ctx, offload_wait_duration);
 
     match peer.total_connection_timeout() {
         Some(t) => match pingora_timeout::timeout(t, connect_future).await {
@@ -412,10 +449,21 @@ async fn do_connect_inner<P: Peer + Send + Sync>(
     bind_to: Option<BindTo>,
     alpn_override: Option<ALPN>,
     tls_ctx: &TlsConnector,
+    offload_wait_duration: Option<Duration>,
 ) -> Result<Stream> {
-    let stream = l4_connect(peer, bind_to).await?;
+    let l4_connect_start = Instant::now();
+    let mut stream = l4_connect(peer, bind_to).await?;
+    stream.set_establishment_timing(l4_connect_start.elapsed(), offload_wait_duration);
     if peer.tls() {
-        let tls_stream = tls::connect(stream, peer, alpn_override, tls_ctx).await?;
+        // Capture the local address before the handshake consumes the stream, so a TLS failure
+        // can still report the address we connected from.
+        // Arc clone plus a copy of the small SocketAddr, negligible next to the handshake.
+        let local_addr = stream
+            .get_socket_digest()
+            .and_then(|digest| digest.local_addr().and_then(|addr| addr.as_inet()).copied());
+        let tls_stream = tls::connect(stream, peer, alpn_override, tls_ctx)
+            .await
+            .map_err(|e| attach_connect_local_addr(e, local_addr))?;
         Ok(Box::new(tls_stream))
     } else {
         Ok(Box::new(stream))
@@ -576,10 +624,29 @@ mod tests {
         let peer = BasicPeer::new("1.1.1.1:80");
         // make a new connection to 1.1.1.1
         let stream = connector.new_stream(&peer).await.unwrap();
+        let timing = stream.get_timing_digest();
+        assert_eq!(timing.len(), 1);
+        let l4_timing = timing[0].as_ref().unwrap();
+        assert!(l4_timing.establishment_duration.is_some());
+        assert!(l4_timing.offload_wait_duration.is_none());
         connector.release_stream(stream, peer.reuse_hash(), None);
 
         let (_, reused) = connector.get_stream(&peer).await.unwrap();
         assert!(reused);
+    }
+
+    #[tokio::test]
+    async fn test_connect_with_offload_timing() {
+        let mut conf = ConnectorOptions::new(1);
+        conf.offload_threadpool = Some((1, 1));
+        let connector = TransportConnector::new(Some(conf));
+        let peer = BasicPeer::new("1.1.1.1:80");
+
+        let stream = connector.new_stream(&peer).await.unwrap();
+        let timing = stream.get_timing_digest();
+        let l4_timing = timing[0].as_ref().unwrap();
+        assert!(l4_timing.establishment_duration.is_some());
+        assert!(l4_timing.offload_wait_duration.is_some());
     }
 
     #[tokio::test]
@@ -590,6 +657,14 @@ mod tests {
         peer.sni = "one.one.one.one".to_string();
         // make a new connection to https://1.1.1.1
         let stream = connector.new_stream(&peer).await.unwrap();
+        let timing = stream.get_timing_digest();
+        assert_eq!(timing.len(), 2);
+        let l4_timing = timing[0].as_ref().unwrap();
+        assert!(l4_timing.establishment_duration.is_some());
+        assert!(l4_timing.offload_wait_duration.is_none());
+        let tls_timing = timing[1].as_ref().unwrap();
+        assert!(tls_timing.establishment_duration.is_some());
+        assert!(tls_timing.offload_wait_duration.is_none());
         connector.release_stream(stream, peer.reuse_hash(), None);
 
         let (_, reused) = connector.get_stream(&peer).await.unwrap();
@@ -612,7 +687,7 @@ mod tests {
         // make a new connection to mock uds
         let mut stream = connector.new_stream(&peer).await.unwrap();
         let mut buf = [0; 9];
-        let _ = stream.read(&mut buf).await.unwrap();
+        stream.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"it works!");
 
         // Test connection reuse by releasing and getting the stream back
@@ -624,6 +699,78 @@ mod tests {
         drop(stream);
         let _ = shutdown_tx.send(());
         server_handle.await.unwrap();
+    }
+
+    /// Wakes the test when the idle watcher's unlock wakes the pickup, then blocks the
+    /// watcher's thread until the test has polled the pickup again.
+    struct StallingWaker {
+        woken: std::sync::mpsc::SyncSender<()>,
+        resume: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl std::task::Wake for StallingWaker {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            let _ = self.woken.send(());
+            let _ = self.resume.lock().unwrap().recv();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_reuse_stream_while_idle_watcher_is_unlocking() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        // An upstream that accepts connections and never writes to them, so a pooled
+        // connection always stays reusable.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer = BasicPeer::new(&listener.local_addr().unwrap().to_string());
+        tokio::spawn(async move {
+            let mut accepted = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                accepted.push(stream);
+            }
+        });
+
+        let connector = TransportConnector::new(None);
+        let mut stream = connector.new_stream(&peer).await.unwrap();
+        for _ in 0..100 {
+            connector.release_stream(stream, peer.reuse_hash(), None);
+
+            let (woken_tx, woken_rx) = std::sync::mpsc::sync_channel(1);
+            let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+            let waker = Waker::from(Arc::new(StallingWaker {
+                woken: woken_tx,
+                resume: std::sync::Mutex::new(resume_rx),
+            }));
+            let mut cx = Context::from_waker(&waker);
+            // Unconstrained, so tokio's coop budget never calls the stalling waker on this thread.
+            let mut pickup =
+                std::pin::pin!(tokio::task::unconstrained(connector.reused_stream(&peer)));
+
+            // The idle watcher almost always still holds the lock when the pickup first asks
+            // for it. When it let go first there is no unlock to poll inside, so try again.
+            if let Poll::Ready(reused) = pickup.as_mut().poll(&mut cx) {
+                stream = reused.expect("healthy pooled connection was dropped");
+                continue;
+            }
+            woken_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("idle watcher should unlock the stream");
+            // The watcher's thread is now stalled inside its unlock: the lock is free, but the
+            // watcher has not yet dropped its own handle to the stream.
+            let reused = pickup.as_mut().poll(&mut cx);
+            resume_tx.send(()).unwrap();
+            assert!(
+                matches!(reused, Poll::Ready(Some(_))),
+                "healthy pooled connection was dropped"
+            );
+            return;
+        }
+        panic!("the idle watcher never held the lock when the pickup asked for it");
     }
 
     // 192.0.2.1 is TEST-NET-1 (RFC 5737) — SYN packets are silently
@@ -684,7 +831,7 @@ mod tests {
     /// the decomposed error type and message.
     async fn get_do_connect_failure_with_peer(peer: &BasicPeer) -> (ErrorType, String) {
         let tls_connector = Connector::new(None);
-        let stream = do_connect(peer, None, None, &tls_connector.ctx).await;
+        let stream = do_connect(peer, None, None, &tls_connector.ctx, None).await;
         match stream {
             Ok(_) => panic!("should throw an error"),
             Err(e) => (
@@ -731,6 +878,38 @@ mod tests {
         let peer = BasicPeer::new(BLACKHOLE);
         let (etype, context) = get_do_connect_failure_with_peer(&peer).await;
         assert!(etype != ConnectTimedout || !context.contains("total-connection timeout"));
+    }
+
+    #[tokio::test]
+    async fn test_tls_handshake_failure_records_local_addr() {
+        use crate::connectors::l4::ConnectErrorExt;
+
+        // A plaintext listener that closes each connection immediately, so the TLS handshake fails
+        // after the TCP connection is established.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+
+        // Non-empty SNI makes BasicPeer request TLS against the plaintext listener.
+        let mut peer = BasicPeer::new(&server_addr.to_string());
+        peer.sni = "openrusty.org".to_string();
+        // Safety net so the test fails fast rather than hanging if a platform does not surface the
+        // handshake failure immediately; a handshake timeout still exercises the same code path.
+        peer.options.connection_timeout = Some(Duration::from_secs(5));
+
+        let tls_connector = Connector::new(None);
+        let err = do_connect(&peer, None, None, &tls_connector.ctx, None)
+            .await
+            .unwrap_err();
+
+        let local_addr = err
+            .connect_local_addr()
+            .expect("TLS handshake failure should retain the assigned local address");
+        assert_ne!(local_addr.port(), 0);
     }
 
     #[tokio::test]

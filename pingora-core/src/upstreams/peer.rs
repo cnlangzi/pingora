@@ -17,10 +17,10 @@
 use crate::connectors::{l4::BindTo, L4Connect};
 use crate::protocols::l4::socket::SocketAddr;
 use crate::protocols::tls::CaType;
-#[cfg(feature = "openssl_derived")]
-use crate::protocols::tls::HandshakeCompleteHook;
 #[cfg(feature = "s2n")]
 use crate::protocols::tls::PskType;
+#[cfg(feature = "openssl_derived")]
+use crate::protocols::tls::{HandshakeCompleteHook, VerifyCallback};
 #[cfg(unix)]
 use crate::protocols::ConnFdReusable;
 use crate::protocols::TcpKeepalive;
@@ -304,6 +304,16 @@ pub trait Peer: Display + Clone {
             .upstream_tls_handshake_complete_hook
             .as_ref()
     }
+
+    /// Returns a callback that should be run while the upstream's certificate chain is verified.
+    ///
+    /// See [`PeerOptions::upstream_tls_verify_callback`].
+    #[cfg(feature = "openssl_derived")]
+    fn upstream_tls_verify_callback(&self) -> Option<&VerifyCallback> {
+        self.get_peer_options()?
+            .upstream_tls_verify_callback
+            .as_ref()
+    }
 }
 
 /// A simple TCP or TLS peer without many complicated settings.
@@ -367,6 +377,8 @@ impl Peer for BasicPeer {
     fn reuse_hash(&self) -> u64 {
         let mut hasher = AHasher::default();
         self._address.hash(&mut hasher);
+        // fixed on the TLS stream when the connection is made
+        self.options.tls_write_coalescing.hash(&mut hasher);
         hasher.finish()
     }
 
@@ -399,6 +411,95 @@ impl Scheme {
             Self::HTTP
         }
     }
+}
+
+/// Policy for forwarding request headers to HTTP upstreams.
+///
+/// This policy applies to automatically forwarded downstream request headers. Application code
+/// may deliberately alter the resulting request in its upstream request filter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HttpUpstreamRequestPolicy {
+    /// Strip standard hop-by-hop request fields inherited from the downstream request.
+    ///
+    /// Standard hop-by-hop framing fields are removed. If a non-empty request body is unframed
+    /// after application upstream request filtering, Pingora sends it chunked to an HTTP/1
+    /// upstream.
+    pub strip_hop_by_hop: bool,
+    /// Strip extension fields identified by tokens in the downstream `Connection` header field.
+    ///
+    /// Requests nominating `Host`, forwarding-origin fields, or pseudo-header-shaped fields are
+    /// rejected rather than forwarded with protected metadata removed when this behavior is
+    /// enabled.
+    pub strip_connection_nominated: bool,
+    /// Reject `Connection` nominations that are not a valid HTTP `token` (RFC 9110 §5.6.2), such
+    /// as `Connection: "X-Forwarded-For"`, instead of tolerating them as distinct literal fields.
+    ///
+    /// Defaults to `true`. Exact nominations of protected fields and pseudo-headers are rejected
+    /// either way. Only has an effect when
+    /// [`strip_connection_nominated`](Self::strip_connection_nominated) is enabled.
+    pub reject_malformed_connection_nominations: bool,
+    /// Controls forwarding of HTTP/1 protocol upgrade request fields.
+    pub h1_upgrade: H1UpgradePolicy,
+}
+
+impl HttpUpstreamRequestPolicy {
+    /// Use standards-oriented forwarding with normalized WebSocket upgrade support.
+    pub fn standard() -> Self {
+        Self::default()
+    }
+
+    /// Preserve the previous HTTP/1 upstream request-header passthrough behavior.
+    ///
+    /// This mode is RFC-non-compliant and is provided only for legacy compatibility. Use it at
+    /// your own risk: the application's upstream request filter is solely responsible for
+    /// ensuring valid hop-by-hop header handling.
+    pub fn preserve() -> Self {
+        Self {
+            strip_hop_by_hop: false,
+            strip_connection_nominated: false,
+            reject_malformed_connection_nominations: false,
+            h1_upgrade: H1UpgradePolicy::Preserve,
+        }
+    }
+
+    /// Strip hop-by-hop fields and do not forward any HTTP/1 upgrade handshake.
+    pub fn deny_upgrades() -> Self {
+        Self {
+            h1_upgrade: H1UpgradePolicy::Deny,
+            ..Self::default()
+        }
+    }
+}
+
+impl Default for HttpUpstreamRequestPolicy {
+    fn default() -> Self {
+        Self {
+            strip_hop_by_hop: true,
+            strip_connection_nominated: true,
+            reject_malformed_connection_nominations: true,
+            h1_upgrade: H1UpgradePolicy::WebSocketOnly,
+        }
+    }
+}
+
+/// Policy for forwarding HTTP/1 protocol upgrade request fields.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum H1UpgradePolicy {
+    /// Forward normalized upgrade fields only for a valid WebSocket upgrade request.
+    WebSocketOnly,
+    /// Preserve complete request metadata for HTTP/1 requests containing an upgrade field.
+    ///
+    /// This is RFC-non-compliant and is provided only for legacy compatibility. Use it at your
+    /// own risk: the application's upstream request filter is solely responsible for ensuring
+    /// valid hop-by-hop metadata for upgraded requests.
+    ///
+    /// When this is selected, automatic hop-by-hop normalization is skipped for upgrade requests
+    /// because protocol-specific handshakes can depend on any connection-nominated field.
+    /// Protected nomination validation applies only when
+    /// [`HttpUpstreamRequestPolicy::strip_connection_nominated`] is enabled.
+    Preserve,
+    /// Do not forward HTTP/1 upgrade request fields.
+    Deny,
 }
 
 /// The preferences to connect to a remote server
@@ -440,13 +541,20 @@ pub struct PeerOptions {
     /// Initial connection-level H2 receive window size in bytes.
     /// If `None`, the default of 8MB is used.
     pub h2_connection_window_size: Option<u32>,
-    /// Allow invalid Content-Length in HTTP/1 responses (non-RFC compliant).
+    /// Allow a single invalid Content-Length in HTTP/1 responses (non-RFC compliant).
     ///
-    /// When enabled, invalid Content-Length responses are treated as close-delimited responses.
+    /// When enabled, a response carrying a single, otherwise-unparseable
+    /// Content-Length value is treated as a close-delimited response instead of
+    /// being rejected. Conflicting or duplicate Content-Length values (multiple
+    /// header lines, or a comma-separated list with differing values) are an
+    /// unrecoverable framing error and are always rejected, even when this is
+    /// enabled.
     ///
     /// **Note:** This field is unstable and may be removed or changed in future versions.
     /// It exists primarily for compatibility with legacy servers that send malformed headers.
     pub allow_h1_response_invalid_content_length: bool,
+    /// Controls automatically forwarded request headers sent to HTTP upstreams.
+    pub http_upstream_request_policy: HttpUpstreamRequestPolicy,
     pub extra_proxy_headers: BTreeMap<String, Vec<u8>>,
     /// The list of curves the tls connection should advertise
     /// if `None`, the default curves will be used
@@ -455,6 +563,12 @@ pub struct PeerOptions {
     pub second_keyshare: bool,
     /// whether to enable TCP fast open
     pub tcp_fast_open: bool,
+    /// Whether to coalesce the vectored writes of TLS connections to this peer, which is
+    /// default off. See `SslStream::enable_write_coalescing`. Only BoringSSL and OpenSSL
+    /// connections support it; other TLS backends ignore it.
+    ///
+    /// **Note:** This field is unstable and may be removed or changed in future versions.
+    pub tls_write_coalescing: bool,
     /// use Arc because Clone is required but not allowed in trait object
     pub tracer: Option<Tracer>,
     /// A custom L4 connector to use to establish new L4 connections
@@ -471,6 +585,34 @@ pub struct PeerOptions {
     #[cfg(feature = "openssl_derived")]
     #[derivative(Debug = "ignore")]
     pub upstream_tls_handshake_complete_hook: Option<HandshakeCompleteHook>,
+    /// Callback run while the upstream's certificate chain is verified, with the semantics of an
+    /// `SSL_set_verify` callback.
+    ///
+    /// It is called with the result so far (`preverify_ok`) for each certificate in the built
+    /// chain and for each error found, and its return value replaces that result: returning
+    /// `false` fails verification and stops it, returning `true` for an error accepts the chain
+    /// despite that error, and returning `preverify_ok` only observes.
+    /// [`X509StoreContextRef::chain`] holds the chain built so far.
+    ///
+    /// It runs inside the TLS library's verify callback, so a panic aborts the process.
+    ///
+    /// It also runs when certificate verification is off (`verify_cert` is false or the SNI is
+    /// empty), where its return value cannot fail the handshake, though returning `false` still
+    /// stops verification.
+    ///
+    /// It runs during each full handshake when the server's certificate arrives, before the
+    /// server has proven it holds the certificate's key, so being called does not mean the
+    /// handshake will succeed. It does not run for resumed sessions, on renegotiation, or for
+    /// connections reused from the pool. It is not part of the connection reuse key either, so a
+    /// pooled connection established without it, or with another callback, can be reused for
+    /// this peer. For [`HttpPeer`], use a distinct `group_key` to keep them apart.
+    ///
+    /// Currently only enabled for openssl variants.
+    ///
+    /// [`X509StoreContextRef::chain`]: crate::tls::x509::X509StoreContextRef::chain
+    #[cfg(feature = "openssl_derived")]
+    #[derivative(Debug = "ignore")]
+    pub upstream_tls_verify_callback: Option<VerifyCallback>,
 }
 
 impl PeerOptions {
@@ -504,16 +646,20 @@ impl PeerOptions {
             h2_stream_window_size: None,
             h2_connection_window_size: None,
             allow_h1_response_invalid_content_length: false,
+            http_upstream_request_policy: HttpUpstreamRequestPolicy::default(),
             extra_proxy_headers: BTreeMap::new(),
             curves: None,
             second_keyshare: true, // default true and noop when not using PQ curves
             tcp_fast_open: false,
+            tls_write_coalescing: false,
             tracer: None,
             custom_l4: None,
             upstream_tcp_sock_tweak_hook: None,
             proxy_digest_user_data_hook: None,
             #[cfg(feature = "openssl_derived")]
             upstream_tls_handshake_complete_hook: None,
+            #[cfg(feature = "openssl_derived")]
+            upstream_tls_verify_callback: None,
         }
     }
 
@@ -618,10 +764,23 @@ impl HttpPeer {
     }
 
     /// Create a new [`HttpPeer`] with the given socket address and TLS settings.
-    pub fn new<A: ToInetSocketAddrs>(address: A, tls: bool, sni: String) -> Self {
-        let mut addrs_iter = address.to_socket_addrs().unwrap(); //TODO: handle error
+    ///
+    /// `address` is anything that implements [`ToSocketAddrs`](std::net::ToSocketAddrs).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`SocketError`] if `address` cannot be converted to a socket address, for
+    /// example because it is malformed or its hostname does not resolve.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `address` converts successfully but yields no socket addresses.
+    pub fn new<A: ToInetSocketAddrs>(address: A, tls: bool, sni: String) -> Result<Self> {
+        let mut addrs_iter = address
+            .to_socket_addrs()
+            .or_err(SocketError, "invalid address")?;
         let addr = addrs_iter.next().unwrap();
-        Self::new_from_sockaddr(SocketAddr::Inet(addr), tls, sni)
+        Ok(Self::new_from_sockaddr(SocketAddr::Inet(addr), tls, sni))
     }
 
     /// Create a new [`HttpPeer`] with the given path to Unix domain socket and TLS settings.
@@ -660,14 +819,22 @@ impl HttpPeer {
     }
 
     /// Create a new [`HttpPeer`] with client certificate and key for mutual TLS.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error under the same conditions as [`HttpPeer::new`].
+    ///
+    /// # Panics
+    ///
+    /// Panics under the same conditions as [`HttpPeer::new`].
     pub fn new_mtls<A: ToInetSocketAddrs>(
         address: A,
         sni: String,
         client_cert_key: Arc<CertKey>,
-    ) -> Self {
-        let mut peer = Self::new(address, true, sni);
+    ) -> Result<Self> {
+        let mut peer = Self::new(address, true, sni)?;
         peer.client_cert_key = Some(client_cert_key);
-        peer
+        Ok(peer)
     }
 
     fn peer_hash(&self) -> u64 {
@@ -700,6 +867,8 @@ impl Hash for HttpPeer {
         // adjusted over the lifetime of a connection.
         self.options.curves.hash(state);
         self.options.second_keyshare.hash(state);
+        // fixed on the TLS stream when the connection is made
+        self.options.tls_write_coalescing.hash(state);
     }
 }
 
@@ -796,5 +965,47 @@ impl Display for Proxy {
             self.host,
             self.port
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_http_upstream_request_policy_is_standards_oriented() {
+        let policy = PeerOptions::new().http_upstream_request_policy;
+        assert!(policy.strip_hop_by_hop);
+        assert!(policy.strip_connection_nominated);
+        assert!(policy.reject_malformed_connection_nominations);
+        assert_eq!(policy.h1_upgrade, H1UpgradePolicy::WebSocketOnly);
+    }
+
+    #[test]
+    fn preserve_http_upstream_request_policy_is_a_legacy_preset() {
+        let policy = HttpUpstreamRequestPolicy::preserve();
+        assert!(!policy.strip_hop_by_hop);
+        assert!(!policy.strip_connection_nominated);
+        assert!(!policy.reject_malformed_connection_nominations);
+        assert_eq!(policy.h1_upgrade, H1UpgradePolicy::Preserve);
+    }
+
+    /// A connection keeps the write coalescing it was made with, so a peer that changes the
+    /// setting must not reuse it.
+    #[test]
+    fn peers_differing_in_tls_write_coalescing_do_not_share_connections() {
+        let peer = HttpPeer::new("127.0.0.1:443", true, "pingora.org".into()).unwrap();
+        let mut coalescing = peer.clone();
+        coalescing.options.tls_write_coalescing = true;
+        assert_ne!(peer.reuse_hash(), coalescing.reuse_hash());
+    }
+
+    #[test]
+    fn basic_peers_differing_in_tls_write_coalescing_do_not_share_connections() {
+        let mut peer = BasicPeer::new("127.0.0.1:443");
+        peer.sni = "pingora.org".into();
+        let mut coalescing = peer.clone();
+        coalescing.options.tls_write_coalescing = true;
+        assert_ne!(peer.reuse_hash(), coalescing.reuse_hash());
     }
 }
